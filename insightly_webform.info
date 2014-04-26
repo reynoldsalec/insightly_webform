@@ -1,0 +1,16 @@
+name = "Salesforce Web-to-Lead Webform Data Integration"
+description = "Integrates Salesforce Web-to-Lead Form feature with various webforms"
+package = Webform
+core = 7.x
+
+files[] = insightly_webform.install
+files[] = insightly_webform.module
+
+dependencies[] = webform
+dependencies[] = options_element
+; Information added by drupal.org packaging script on 2013-05-25
+version = "7.x-1.0-rc3+1-dev"
+core = "7.x"
+project = "insightly_webform"
+datestamp = "1369453263"
+

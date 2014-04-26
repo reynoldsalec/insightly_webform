@@ -1,0 +1,310 @@
+<?php
+/**
+ * @file insightly_webform.module
+ *
+ * @author Chris Calip, updated to D7 by Adrian Rollett.
+ * @date 2012-02-02
+ */
+
+define('INSIGHTLY_API_PATH', 'https://api.insight.ly/');
+
+/**
+ * Implemens hook_permission()
+ * @return array
+ */
+function insightly_webform_permission() {
+  $perms = array();
+  $perms['administer insightly webform'] = array(
+    'title' => t('Administer Insightly webform'),
+    'description' => t('Administer the insightly webform module.'),
+  );
+  return $perms;
+}
+
+/**
+ * Implements hook_menu()
+ *
+ * @return array
+ */
+function insightly_webform_menu() {
+  $items = array();
+  $items['admin/config/services/insightly_webform'] = array(
+    'title' => 'Insightly Webform',
+    'description' => 'Configure webform insightly integration settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('insightly_webform_form'),
+    'access arguments' => array('administer insightly webform'),
+    'file' => 'insightly_webform.admin.inc'
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_form_alter()
+ *
+ * @param $form
+ * @param $form_state
+ * @param $form_id
+ *
+ * @return
+ */
+function insightly_webform_form_alter(&$form, &$form_state, $form_id) {
+  // Handle editing of webform nodes.
+  if ($form_id == 'webform_node_form') {
+    if (!_insightly_webform_check_settings()) {
+      drupal_set_message(t('Insightly Webform Settings not set! You can configure the settings <a href="@url">Insightly Webform settings page</a>.', array('@url' => url('admin/config/services/insightly_webform'))), 'warning');
+      return;
+    }
+    /* Collapse the email info on the page assuming that it is going to be a Insightly Settings form. */
+    $form['mailsettings']['#collapsed'] = TRUE;
+    /* Start Insightly Settings Form */
+    $insightly_webform['settings'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Insightly Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+      '#weight' => -2,
+    );
+    $insightly_webform['settings']['use_insightly_webform'] = array(
+      '#type' => 'radios',
+      '#title' => t('Submit to Insightly'),
+      '#options' => array(
+        1 => t('Yes'), 0 => t('No')
+      ),
+      '#description' => t('If yes, the form will be sent via CURL to Insightly.'),
+      '#default_value' => isset($form['#node']->use_insightly_webform) ? $form['#node']->use_insightly_webform : 0,
+    );
+
+    /* End Insightly settings form */
+    // integrate the Insightly Webform Settings form
+    $pos = array_search('mailsettings', array_keys($form)) + 1;
+    $form = array_merge(array_slice($form, 0, $pos), $insightly_webform, array_slice($form, $pos));
+  }
+}
+
+/**
+ * Check if one of the settings is not set.
+ * @return bool
+ */
+function _insightly_webform_check_settings() {
+  $insightly_api_key = variable_get('insightly_api_key', '');
+  // if one of the settings is not set
+  if (empty ($insightly_api_key)) {
+    return FALSE;
+  }
+  else {
+    return TRUE;
+  }
+}
+
+/**
+ * Respond to a Webform submission being inserted.
+ *
+ * Note that this hook is called after a submission has already been saved to
+ * the database. If needing to modify the submission prior to insertion, use
+ * hook_webform_submission_presave().
+ *
+ * @param $node
+ *   The Webform node on which this submission was made.
+ * @param $submission
+ *   The Webform submission that was just inserted into the database.
+ */
+function insightly_webform_webform_submission_insert($node, $submission) {
+  if ( !isset($node->use_insightly_webform) ) {
+    return;
+  }
+  if ($node->use_insightly_webform != TRUE) {
+    return;
+  }
+  if ($submission->is_draft == 1 ) {
+    return;
+  }
+  $posted_fields = array();
+  $posted_fields_multi_value = array();
+  // $posted_fields
+  foreach ($submission->data as $key => $value) {
+    $values_count = count($value['value']);
+    if (is_int($key) && $values_count == 1) {
+      $field_key = $node->webform['components'][$key]['form_key'];
+      $field_value = $value['value'][0];
+      $posted_fields[$field_key] = $field_value;
+    }
+    elseif ($values_count > 1) {
+      // Multivalue logic here.
+      $field_key = $node->webform['components'][$key]['form_key'];
+      foreach ($value['value'] as $value_key => $value_content) {
+        $posted_fields_multi_value[$field_key][$value_key] = $value_content;
+      }
+    }
+  }
+
+  $curl = curl_init();
+  $data = array();
+  $insightly_webform_mapping_settings = variable_get('insightly_webform_mapping_settings', array());
+
+  // Insert single-value fields.
+  foreach ($posted_fields as $post_field => $post_field_value) {
+    $data[insightly_webform_to_insightly_field($post_field, $insightly_webform_mapping_settings)] = $post_field_value;
+  }
+  $context = array(
+    // webform submission object containing data like $submission->nid (webform node id), $submission->uid (uid of person)..
+    'webform_submission' => $submission,
+  );
+  drupal_alter('insightly_webform_posted_data', $data, $context);
+
+  // Insert multi-value fields.
+  foreach ($posted_fields_multi_value as $post_field => $post_field_value) {
+    $saleforce_post_field = insightly_webform_to_insightly_field($post_field, $insightly_webform_mapping_settings);
+    $data[insightly_webform_to_insightly_field($post_field, $insightly_webform_mapping_settings)][] = $post_field_value;
+  }
+
+  // Convert data into JSON.
+  $json_data = drupal_json_encode($data);
+  $api_key = variable_get('insightly_api_key');
+  if (!isset($api_key)) {
+  	$admin_url = 'admin/config/services/insightly_webform';
+  	watchdog('insightly_webform', 'API Key is not set, request failed.', array(), WATCHDOG_NOTICE, NULL);
+  	return;
+  }
+
+  dpm($json_data);
+  $encoded_api_key = base64_encode($api_key);
+
+  curl_setopt($curl, CURLOPT_URL, INSIGHTLY_API_PATH . $insightly_api_version . '/Contacts');
+  curl_setopt($curl, CURLOPT_USERPWD, $encoded_api_key . ':');
+  curl_setopt($curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+  curl_setopt($curl, CURLOPT_ENCODING, 'gzip');
+  curl_setopt($curl, CURLOPT_POST, 1);
+  curl_setopt($curl, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
+  curl_setopt($curl, CURLOPT_POSTFIELDS, $json_data);
+  curl_setopt($curl, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($curl, CURLOPT_HEADER, 1);
+  curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, FALSE);
+  curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, FALSE);
+  curl_setopt($curl, CURLOPT_USERAGENT, "insightly_webform module for Drupal");
+  $response = curl_exec($curl);
+
+  if (curl_error($curl)) {
+    watchdog('insightly_webform', 'Error submitting Insightly WebToLead: ' . curl_errno($curl) . ' ' . curl_error($curl), array(), WATCHDOG_ERROR, NULL);
+  }
+  curl_close($curl);
+  $insightly_webform_debug = variable_get('insightly_webform_debug', FALSE);
+  if ( $insightly_webform_debug ) {
+    watchdog('insightly_webform', "$query_data", array(), WATCHDOG_NOTICE, NULL);
+  }
+}
+
+/**
+ * Return the Insightly equivalent to a given webform field
+ * @param string $field
+ * @param array  $insightly_webform_mapping_settings
+ * @return string Insightly field name, when available, else $field
+ */
+function insightly_webform_to_insightly_field($field, $insightly_webform_mapping_settings) {
+  $insightly_fields = array();
+  foreach ($insightly_webform_mapping_settings as $key => $value) {
+    $insightly_fields[$key] = $value;
+  }
+  $old_insightly_fields = array(
+    'first_name' => 'first_name',
+  );
+  if (empty($insightly_fields)) {
+    $insightly_fields = $old_insightly_fields;
+  }
+  if (array_key_exists($field, $insightly_fields)) {
+    return $insightly_fields[$field];
+  }
+  else {
+    return $field;
+  }
+}
+
+/**
+ * Implements hook_node_insert()
+ *  Stores insightly webform settings.
+ *
+ * @param $node
+ */
+function insightly_webform_node_insert($node) {
+  _insightly_webform_update_node($node);
+}
+
+/**
+ * Implements hook_node_save()
+ *  Stores updated insightly webform settings.
+ *
+ * @param $node
+ */
+function insightly_webform_node_update($node) {
+  _insightly_webform_update_node($node);
+}
+
+/**
+ * Implements hook_node_delete()
+ *   Deletes insightly settings when a webform node is deleted.
+ *
+ * @param $node
+ */
+function insightly_webform_node_delete($node) {
+  if ($node->type == 'webform') {
+    if (isset($node->use_insightly_webform) ) {
+      $deleted = db_delete('insightly_webform')
+        ->condition('vid', $node->vid)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_node_load()
+ *   Stores insightly settings when a webform node is loaded.
+ * @param $node
+ *
+ * @todo : probably remove; lead source isn't a default field,
+ * should have people enter it manually.
+ *
+ */
+function insightly_webform_node_load($nodes, $types) {
+  foreach ($nodes as $node) {
+    if ($node->type == 'webform') {
+      $result = db_select('insightly_webform', 's')
+        ->fields('s', array('active', 'lead_source'))
+        ->condition('vid', $node->vid)
+        ->execute();
+      while ($record = $result->fetchAssoc()) {
+        // The result has either 0 or 1 rows, if we have one then add it to the node.
+        if ($record['active'] == '1' ) {
+          $node->use_insightly_webform = 1;
+          $node->lead_source_insightly_webform = $record['lead_source'];
+        }
+        else {
+          $node->use_insightly_webform = 0;
+          $node->lead_source_insightly_webform = $record['lead_source'];
+        }
+      }
+    }
+  }
+}
+
+
+/**
+ * Helper function to save insightly_webform info when a node is created/updated.
+ *
+ * @todo : probably remove
+ *
+ * @param $node
+ */
+function _insightly_webform_update_node($node) {
+  if ($node->type == 'webform') {
+    if (isset($node->use_insightly_webform)) {
+      // Store the  Webform Insightly settings.
+      $query = db_merge('insightly_webform')
+        ->key(array('vid' => $node->vid))
+        ->fields(array(
+          'active' => $node->use_insightly_webform,
+          'lead_source' => $node->lead_source_insightly_webform,
+        ))
+        ->execute();
+    }
+  }
+}
